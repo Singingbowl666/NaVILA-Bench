@@ -72,6 +72,17 @@ class VLMServer:
             self.image_processor = image_processor
         self.model = self.model.to(self.args.device)
 
+    @staticmethod
+    def _recvall(sock, n):
+        """Receive exactly n bytes from socket, return None if connection closed early."""
+        data = b''
+        while len(data) < n:
+            packet = sock.recv(n - len(data))
+            if not packet:
+                return None
+            data += packet
+        return data
+
     def start_server(self, host='localhost', port=12345):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.bind((host, port))
@@ -81,17 +92,18 @@ class VLMServer:
         while True:
             conn, addr = server_socket.accept()
             try:
-                # Receive data size first
-                size_data = conn.recv(8)
+                # Receive data size first (exactly 8 bytes)
+                size_data = self._recvall(conn, 8)
+                if size_data is None:
+                    print(f"Client {addr} disconnected before sending size header.")
+                    continue
                 size = int.from_bytes(size_data, 'big')
-                
-                # Receive the actual data
-                data = b''
-                while len(data) < size:
-                    packet = conn.recv(4096)
-                    if not packet:
-                        break
-                    data += packet
+
+                # Receive the actual data (exactly size bytes)
+                data = self._recvall(conn, size)
+                if data is None:
+                    print(f"Client {addr} disconnected before sending full payload.")
+                    continue
 
                 # Parse the received data
                 request = json.loads(data.decode())
