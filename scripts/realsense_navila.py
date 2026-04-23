@@ -3,6 +3,8 @@ Real-world NaViLA inference script.
 Captures images from a RealSense camera, samples them, sends to a remote VLM server,
 and receives navigation commands in return.
 
+Uses parallel processing: VLM inference and command execution run concurrently.
+
 No Isaac Sim dependency.
 """
 
@@ -11,8 +13,10 @@ import base64
 import io
 import json
 import socket
+import threading
 import time
 from collections import deque
+from queue import Queue, Empty
 
 import cv2
 import numpy as np
@@ -35,6 +39,8 @@ parser.add_argument("--max_images", type=int, default=200,
                     help="Maximum number of images to buffer before the episode ends.")
 parser.add_argument("--save_images", action="store_true", default=False,
                     help="Save sampled images to disk for debugging.")
+parser.add_argument("--idle_rotation_speed", type=float, default=0.1,
+                    help="Angular speed (rad/s) to rotate slowly when no rotation command is active.")
 args = parser.parse_args()
 
 
@@ -259,22 +265,8 @@ def parse_vlm_response(text: str):
         return "move_forward", 0.5
 
 
-def execute_command(action: str, duration: float, cmd_vel_pub: rospy.Publisher):
-    """
-    Publish /cmd_vel Twist messages for the given duration, then stop.
-
-    Velocity constants:
-      move_forward : linear.x  =  0.5 m/s
-      turn_left    : angular.z = +0.52 rad/s  (~30 deg/s)
-      turn_right   : angular.z = -0.52 rad/s
-
-    Args:
-        action:       Action token from the VLM (e.g. "move_forward").
-        duration:     How many seconds to execute the action.
-        cmd_vel_pub:  rospy.Publisher for /cmd_vel.
-    """
-    PUBLISH_HZ = 10  # control loop frequency
-
+def build_twist(action: str) -> Twist:
+    """Return a Twist message for the given action token."""
     twist = Twist()
     if action == "move_forward":
         twist.linear.x = 0.5
@@ -282,24 +274,89 @@ def execute_command(action: str, duration: float, cmd_vel_pub: rospy.Publisher):
         twist.angular.z = 0.52
     elif action == "turn_right":
         twist.angular.z = -0.52
-    # "stop" leaves all fields at 0
+    return twist
 
-    print(f"[Robot] Executing action='{action}' for {duration:.2f}s")
+# ---------------------------------------------------------------------------
+# VLM worker thread
+# ---------------------------------------------------------------------------
 
-    if action == "stop":
-        cmd_vel_pub.publish(Twist())
-        print("[Robot] Stop command sent.")
-        return
+def vlm_worker(pipeline, image_buffer, buffer_lock, response_queue, stop_event):
+    """
+    Worker thread that continuously captures frames and sends them to VLM.
+    Puts responses into response_queue for the main thread to consume.
 
-    rate = rospy.Rate(PUBLISH_HZ)
-    end_time = time.time() + duration
-    while time.time() < end_time and not rospy.is_shutdown():
-        cmd_vel_pub.publish(twist)
-        rate.sleep()
+    Args:
+        pipeline: Camera pipeline object.
+        image_buffer: Shared list of captured images.
+        buffer_lock: threading.Lock for thread-safe buffer access.
+        response_queue: Queue to put (response, frame_bgr) tuples.
+        stop_event: threading.Event to signal thread shutdown.
+    """
+    last_vlm_time = None
 
-    # Send zero-velocity to stop the robot
-    cmd_vel_pub.publish(Twist())
-    print(f"[Robot] Action '{action}' complete, cmd_vel zeroed.")
+    while not stop_event.is_set():
+        # 1. Capture frame
+        try:
+            frame = get_frame(pipeline)
+        except RuntimeError as e:
+            print(f"[VLM Worker] Camera error: {e}")
+            continue
+
+        # 2. Thread-safe buffer update
+        with buffer_lock:
+            image_buffer.append(frame)
+            frame_count = len(image_buffer)
+            # Check max_images limit
+            if frame_count >= args.max_images:
+                print("[VLM Worker] Reached max image buffer size. Signaling stop.")
+                stop_event.set()
+                break
+
+        print(f"[VLM Worker] Captured frame #{frame_count}")
+
+        # 3. Optionally save for debugging
+        if args.save_images:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            frame.save(f"debug_frame_{ts}_{frame_count:04d}.jpg")
+
+        # 4. Send to VLM
+        try:
+            with buffer_lock:
+                # Copy buffer for VLM request
+                buffer_copy = list(image_buffer)
+
+            query_initiated_time = time.time()
+            response = send_to_vlm(buffer_copy, args.vlm_host, args.vlm_port, args.query)
+
+            now = time.time()
+            if last_vlm_time is not None:
+                print(f"[VLM Worker] Interval since last response: {now - last_vlm_time:.2f}s")
+            last_vlm_time = now
+            print(f"[VLM Worker] Response: {response}")
+
+            # Convert frame for display
+            frame_bgr = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
+
+            # Put response in queue (non-blocking, drop oldest if full)
+            if response_queue.full():
+                try:
+                    response_queue.get_nowait()
+                except:
+                    pass
+            response_queue.put((response, frame_bgr, query_initiated_time))
+
+        except ConnectionRefusedError:
+            print(f"[VLM Worker] Cannot connect to VLM server at {args.vlm_host}:{args.vlm_port}. Retrying...")
+            time.sleep(1.0)
+            continue
+        except Exception as e:
+            print(f"[VLM Worker] Error: {e}")
+            continue
+
+        # 5. Wait before next capture
+        time.sleep(args.capture_interval)
+
+    print("[VLM Worker] Thread exiting.")
 
 
 # ---------------------------------------------------------------------------
@@ -318,57 +375,89 @@ def main():
 
     pipeline = init_camera()
 
+    # Shared state
     image_buffer: list = []
-    episode_done = False
-    last_vlm_time = None
+    buffer_lock = threading.Lock()
+    response_queue = Queue(maxsize=1)  # Only keep latest response
+    stop_event = threading.Event()
+
+    # Start VLM worker thread
+    vlm_thread = threading.Thread(
+        target=vlm_worker,
+        args=(pipeline, image_buffer, buffer_lock, response_queue, stop_event),
+        daemon=True
+    )
+    vlm_thread.start()
+    print("[INFO] VLM worker thread started. Running in parallel mode.")
+
+    current_action: str = None
+    current_end_time = 0.0
+    current_duration = 0.0
+    last_rotation_end_time = 0.0
+
+    idle_twist = Twist()
+    idle_twist.angular.z = args.idle_rotation_speed
+
+    PUBLISH_HZ = 10
+    rate = rospy.Rate(PUBLISH_HZ)
 
     try:
-        while not episode_done:
-            # 1. Capture frame from RealSense
-            frame = get_frame(pipeline)
-            image_buffer.append(frame)
-            print(f"[INFO] Captured frame #{len(image_buffer)}")
+        while not stop_event.is_set() and not rospy.is_shutdown():
+            now = time.time()
 
-            # 2. Optionally save for debugging
-            if args.save_images:
-                ts = time.strftime("%Y%m%d-%H%M%S")
-                frame.save(f"debug_frame_{ts}_{len(image_buffer):04d}.jpg")
-
-            # 3. Send buffered images to VLM
+            # 1. Check for new VLM response (non-blocking) — update immediately
             try:
-                current_frame_bgr = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
-                cv2.imshow("NaViLA - Current Frame", current_frame_bgr)
-                cv2.waitKey(1)
-                response = send_to_vlm(image_buffer, args.vlm_host, args.vlm_port, args.query)
-                now = time.time()
-                if last_vlm_time is not None:
-                    print(f"[VLM] Interval since last response: {now - last_vlm_time:.2f}s")
-                last_vlm_time = now
-                print(f"[VLM] Response: {response}")
-            except ConnectionRefusedError:
-                print(f"[ERROR] Cannot connect to VLM server at {args.vlm_host}:{args.vlm_port}. Retrying...")
-                time.sleep(1.0)
-                continue
+                response, frame_bgr, query_initiated_time = response_queue.get_nowait()
+                if query_initiated_time >= last_rotation_end_time:
+                    action, duration = parse_vlm_response(response)
+                    print(f"[Robot] New command: action='{action}', duration={duration:.2f}s")
 
-            # 4. Parse and execute command
-            action, duration = parse_vlm_response(response)
-            execute_command(action, duration, cmd_vel_pub)
+                    cv2.imshow("NaViLA - Current Frame", frame_bgr)
+                    cv2.waitKey(1)
 
-            # 5. Check stop condition
-            if action == "stop":
-                print("[INFO] VLM issued stop command. Episode complete.")
-                episode_done = True
+                    if action == "stop":
+                        print("[INFO] VLM issued stop command. Episode complete.")
+                        cmd_vel_pub.publish(Twist())
+                        stop_event.set()
+                        break
 
-            if len(image_buffer) >= args.max_images:
-                print("[INFO] Reached max image buffer size. Stopping episode.")
-                episode_done = True
+                    current_action = action
+                    current_end_time = now + duration
+                    current_duration = duration
+                    if action in ("turn_left", "turn_right"):
+                        last_rotation_end_time = current_end_time
+                else:
+                    print("[Robot] Discarding stale VLM response (query initiated during rotation).")
+            except Empty:
+                pass
 
-            # 6. Wait before next capture
-            time.sleep(args.capture_interval)
+            # 2. Publish velocity based on current state
+            now = time.time()
+            active = current_action is not None and now < current_end_time
+
+            if active:
+                # Within active command window: run at full speed
+                cmd_vel_pub.publish(build_twist(current_action))
+            elif current_action in (None, "turn_left", "turn_right"):
+                # No command yet, or rotation just expired: slow idle rotation
+                cmd_vel_pub.publish(idle_twist)
+            else:
+                # Forward command expired: repeat if short, wait if long
+                if current_duration < 1.0:
+                    cmd_vel_pub.publish(build_twist("move_forward"))
+                else:
+                    print(f"[Robot] Forward command ({current_duration:.2f}s) expired, waiting for new command.")
+                    cmd_vel_pub.publish(Twist())
+
+            rate.sleep()
 
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user.")
+        stop_event.set()
     finally:
+        stop_event.set()
+        cmd_vel_pub.publish(Twist())
+        vlm_thread.join(timeout=2.0)
         stop_camera(pipeline)
         cv2.destroyAllWindows()
         print("[INFO] Camera stopped. Exiting.")

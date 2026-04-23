@@ -2,3 +2,4 @@
 isaaclab_exts/omni.isaac.vlnce/assets
 *.pyc
 *.egg-info
+.results/
